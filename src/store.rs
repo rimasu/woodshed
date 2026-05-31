@@ -177,9 +177,15 @@ impl Store {
         self.state.first_entry().0
     }
 
-    /// Id of the last written entry, or `None` if the store is empty.
+    /// Id of the last accessible entry, or `None` if the store is empty.
+    ///
+    /// Returns `None` when all physically written entries fall before
+    /// [`first_entry_id`](Self::first_entry_id) — i.e. when `truncate_start`
+    /// has advanced the log head past the last written entry.
     pub fn last_entry_id(&self) -> Option<u64> {
-        self.last_entry_id.map(|id| id.0)
+        self.last_entry_id.and_then(|last| {
+            if last.0 < self.state.first_entry().0 { None } else { Some(last.0) }
+        })
     }
 
     fn from_scan_report(cfg: StoreCfg, report: ScanReport) -> Result<Self, OpenError> {
@@ -609,10 +615,11 @@ impl Store {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn scan(&self, from: u64) -> StoreReader<'_> {
-        let from = EntryId(from);
+        // Clamp to log head — entries before first_entry_id are not accessible.
+        let from = EntryId(from.max(self.state.first_entry().0));
 
         // If from is beyond last_entry_id (or store is empty) yield nothing.
-        if self.last_entry_id.is_none_or(|last| from > last) {
+        if self.last_entry_id().is_none_or(|last| from.0 > last) {
             return StoreReader { store: self, scanner: None };
         }
 
