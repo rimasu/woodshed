@@ -1,0 +1,19 @@
+[package]
+name = "woodshed"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Crash-safe append-only log store with split write/sync, designed for use as a Raft log backend"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rimasu/woodshed"
+keywords = ["raft", "log", "wal", "storage", "append-only"]
+categories = ["database-implementations", "filesystem"]
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+metrics = "0.24"
+
+[dev-dependencies]
+tempfile = "3"
