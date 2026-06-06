@@ -636,6 +636,79 @@ mod tests {
     }
 
     #[test]
+    fn codec_truncate_start_empty_drop() {
+        let e = ManifestOp::bare(Op::TruncateStart { first_entry: entry(10), drop: vec![] });
+        assert_eq!(roundtrip(e.clone()), e);
+    }
+
+    #[test]
+    fn codec_truncate_end_empty_drop() {
+        let e = ManifestOp::bare(Op::TruncateEnd { new_active_id: seg(1), byte_offset: 0, drop: vec![] });
+        assert_eq!(roundtrip(e.clone()), e);
+    }
+
+    #[test]
+    fn codec_meta_on_structural_op() {
+        let e = ManifestOp::with_meta(
+            Op::TruncateStart { first_entry: entry(50), drop: vec![seg(1)] },
+            vec![(7u8, b"vote".to_vec()), (8u8, b"committed".to_vec())],
+        );
+        assert_eq!(roundtrip(e.clone()), e);
+    }
+
+    #[test]
+    fn codec_meta_empty_value() {
+        let e = ManifestOp::with_meta(Op::Metadata, vec![(3u8, vec![])]);
+        assert_eq!(roundtrip(e.clone()), e);
+    }
+
+    #[test]
+    fn codec_boundary_values() {
+        let e = ManifestOp::bare(Op::RollSegment {
+            sealed_id: seg(u32::MAX), first_entry: entry(0), last_entry: entry(u64::MAX),
+            entry_count: u32::MAX, final_size: u64::MAX,
+            new_id: seg(0), new_first_entry: entry(u64::MAX),
+        });
+        assert_eq!(roundtrip(e.clone()), e);
+    }
+
+    // The key forward-compatibility property of yatlv: an extra unknown field
+    // written by a newer version of the code must be silently ignored by an
+    // older reader, not cause a decode error.
+    #[test]
+    fn codec_unknown_field_is_ignored() {
+        let mut buf = Vec::new();
+        {
+            let mut frame = FrameBuilder::new(&mut buf);
+            frame.add_u8(TAG_OP_TYPE, OP_CREATE_SEGMENT);
+            frame.add_u32(TAG_SEGMENT_ID, 1);
+            frame.add_u64(TAG_FIRST_ENTRY, 42);
+            frame.add_u64(9999, 0xdeadbeef); // hypothetical future field
+        }
+        let decoded = ManifestOp::decode(&buf).unwrap();
+        assert_eq!(decoded, ManifestOp::bare(Op::CreateSegment { id: seg(1), first_entry: entry(42) }));
+    }
+
+    #[test]
+    fn codec_missing_op_type_field() {
+        let mut buf = Vec::new();
+        { let mut f = FrameBuilder::new(&mut buf); f.add_u32(TAG_SEGMENT_ID, 1); }
+        assert!(matches!(ManifestOp::decode(&buf), Err(DecodeError::Format(_))));
+    }
+
+    #[test]
+    fn codec_missing_required_field() {
+        // CreateSegment without TAG_SEGMENT_ID
+        let mut buf = Vec::new();
+        {
+            let mut f = FrameBuilder::new(&mut buf);
+            f.add_u8(TAG_OP_TYPE, OP_CREATE_SEGMENT);
+            f.add_u64(TAG_FIRST_ENTRY, 0);
+        }
+        assert!(matches!(ManifestOp::decode(&buf), Err(DecodeError::Format(_))));
+    }
+
+    #[test]
     fn codec_unknown_op_type() {
         let mut buf = Vec::new();
         { let mut f = FrameBuilder::new(&mut buf); f.add_u8(TAG_OP_TYPE, 0xff); }
