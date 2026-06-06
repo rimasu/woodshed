@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use yatlv::{FrameBuilder, FrameBuilderLike, FrameParser};
+
 use crate::{EntryId, SegmentId};
 
 // ── ManifestOp ────────────────────────────────────────────────────────────────
@@ -237,17 +239,34 @@ impl StoreState {
 
 // ── Codec ─────────────────────────────────────────────────────────────────────
 //
-// Wire format (all integers big-endian):
-//   CreateSegment:  [0x01][id:4][first_entry:8]   [meta]
-//   RollSegment:    [0x02][sealed_id:4][first_entry:8][last_entry:8][entry_count:4][final_size:8][new_id:4][new_first_entry:8]   [meta]
-//   TruncateStart:  [0x03][first_entry:8][drop_count:4][id:4 × N]   [meta]
-//   TruncateEnd:    [0x04][new_active_id:4][byte_offset:8][drop_count:4][id:4 × N]   [meta]
-//   SegmentDeleted: [0x05][id:4]   [meta]
-//   RecordOrphan:   [0x06][id:4]   [meta]
-//   NoOp:           [0x07]   [meta]
-//
-// Trailing meta section (shared by all ops):
-//   [pairs_count:2][key:1][value_len:2][value × N] ...
+// Each ManifestOp is encoded as a yatlv frame.  Tags:
+//   1  TAG_OP_TYPE         u8  — op discriminator (values 0x01–0x07 below)
+//   2  TAG_SEGMENT_ID      u32 — primary segment id
+//   3  TAG_FIRST_ENTRY     u64
+//   4  TAG_LAST_ENTRY      u64
+//   5  TAG_ENTRY_COUNT     u32
+//   6  TAG_FINAL_SIZE      u64
+//   7  TAG_NEW_SEGMENT_ID  u32
+//   8  TAG_NEW_FIRST_ENTRY u64
+//   9  TAG_BYTE_OFFSET     u64
+//  10  TAG_DROP_ID         u32, repeated once per dropped segment id
+//  11  TAG_META            sub-frame, repeated once per metadata pair:
+//        1  TAG_META_KEY   u8
+//        2  TAG_META_VALUE bytes
+
+const TAG_OP_TYPE: u16         = 1;
+const TAG_SEGMENT_ID: u16      = 2;
+const TAG_FIRST_ENTRY: u16     = 3;
+const TAG_LAST_ENTRY: u16      = 4;
+const TAG_ENTRY_COUNT: u16     = 5;
+const TAG_FINAL_SIZE: u16      = 6;
+const TAG_NEW_SEGMENT_ID: u16  = 7;
+const TAG_NEW_FIRST_ENTRY: u16 = 8;
+const TAG_BYTE_OFFSET: u16     = 9;
+const TAG_DROP_ID: u16         = 10;
+const TAG_META: u16            = 11;
+const TAG_META_KEY: u16        = 1;
+const TAG_META_VALUE: u16      = 2;
 
 const OP_CREATE_SEGMENT: u8  = 0x01;
 const OP_ROLL_SEGMENT: u8    = 0x02;
@@ -261,170 +280,110 @@ const OP_META: u8            = 0x07;
 pub enum DecodeError {
     #[error("unknown op type: {0:#x}")]
     UnknownOpType(u8),
-    #[error("truncated op payload")]
-    Truncated,
+    #[error("malformed frame: {0:?}")]
+    Format(yatlv::Error),
+}
+
+impl From<yatlv::Error> for DecodeError {
+    fn from(e: yatlv::Error) -> Self { DecodeError::Format(e) }
 }
 
 impl ManifestOp {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        match &self.op {
-            Op::CreateSegment { id, first_entry } => {
-                buf.push(OP_CREATE_SEGMENT);
-                buf.extend_from_slice(&id.0.to_be_bytes());
-                buf.extend_from_slice(&first_entry.0.to_be_bytes());
-            }
-            Op::RollSegment { sealed_id, first_entry, last_entry, entry_count, final_size, new_id, new_first_entry } => {
-                buf.push(OP_ROLL_SEGMENT);
-                buf.extend_from_slice(&sealed_id.0.to_be_bytes());
-                buf.extend_from_slice(&first_entry.0.to_be_bytes());
-                buf.extend_from_slice(&last_entry.0.to_be_bytes());
-                buf.extend_from_slice(&entry_count.to_be_bytes());
-                buf.extend_from_slice(&final_size.to_be_bytes());
-                buf.extend_from_slice(&new_id.0.to_be_bytes());
-                buf.extend_from_slice(&new_first_entry.0.to_be_bytes());
-            }
-            Op::TruncateStart { first_entry, drop } => {
-                buf.push(OP_TRUNCATE_START);
-                buf.extend_from_slice(&first_entry.0.to_be_bytes());
-                buf.extend_from_slice(&(drop.len() as u32).to_be_bytes());
-                for id in drop {
-                    buf.extend_from_slice(&id.0.to_be_bytes());
+        {
+            let mut frame = FrameBuilder::new(&mut buf);
+            frame.add_u8(TAG_OP_TYPE, match &self.op {
+                Op::CreateSegment { .. }  => OP_CREATE_SEGMENT,
+                Op::RollSegment { .. }    => OP_ROLL_SEGMENT,
+                Op::TruncateStart { .. }  => OP_TRUNCATE_START,
+                Op::TruncateEnd { .. }    => OP_TRUNCATE_END,
+                Op::SegmentDeleted { .. } => OP_SEGMENT_DELETED,
+                Op::RecordOrphan { .. }   => OP_RECORD_ORPHAN,
+                Op::Metadata              => OP_META,
+            });
+            match &self.op {
+                Op::CreateSegment { id, first_entry } => {
+                    frame.add_u32(TAG_SEGMENT_ID, id.0);
+                    frame.add_u64(TAG_FIRST_ENTRY, first_entry.0);
                 }
-            }
-            Op::TruncateEnd { new_active_id, byte_offset, drop } => {
-                buf.push(OP_TRUNCATE_END);
-                buf.extend_from_slice(&new_active_id.0.to_be_bytes());
-                buf.extend_from_slice(&byte_offset.to_be_bytes());
-                buf.extend_from_slice(&(drop.len() as u32).to_be_bytes());
-                for id in drop {
-                    buf.extend_from_slice(&id.0.to_be_bytes());
+                Op::RollSegment { sealed_id, first_entry, last_entry, entry_count, final_size, new_id, new_first_entry } => {
+                    frame.add_u32(TAG_SEGMENT_ID, sealed_id.0);
+                    frame.add_u64(TAG_FIRST_ENTRY, first_entry.0);
+                    frame.add_u64(TAG_LAST_ENTRY, last_entry.0);
+                    frame.add_u32(TAG_ENTRY_COUNT, *entry_count);
+                    frame.add_u64(TAG_FINAL_SIZE, *final_size);
+                    frame.add_u32(TAG_NEW_SEGMENT_ID, new_id.0);
+                    frame.add_u64(TAG_NEW_FIRST_ENTRY, new_first_entry.0);
                 }
+                Op::TruncateStart { first_entry, drop } => {
+                    frame.add_u64(TAG_FIRST_ENTRY, first_entry.0);
+                    for id in drop { frame.add_u32(TAG_DROP_ID, id.0); }
+                }
+                Op::TruncateEnd { new_active_id, byte_offset, drop } => {
+                    frame.add_u32(TAG_NEW_SEGMENT_ID, new_active_id.0);
+                    frame.add_u64(TAG_BYTE_OFFSET, *byte_offset);
+                    for id in drop { frame.add_u32(TAG_DROP_ID, id.0); }
+                }
+                Op::SegmentDeleted { id } => { frame.add_u32(TAG_SEGMENT_ID, id.0); }
+                Op::RecordOrphan { id }   => { frame.add_u32(TAG_SEGMENT_ID, id.0); }
+                Op::Metadata              => {}
             }
-            Op::SegmentDeleted { id } => {
-                buf.push(OP_SEGMENT_DELETED);
-                buf.extend_from_slice(&id.0.to_be_bytes());
+            for (key, value) in &self.meta {
+                let mut meta = frame.add_frame(TAG_META);
+                meta.add_u8(TAG_META_KEY, *key);
+                meta.add_data(TAG_META_VALUE, value);
             }
-            Op::RecordOrphan { id } => {
-                buf.push(OP_RECORD_ORPHAN);
-                buf.extend_from_slice(&id.0.to_be_bytes());
-            }
-            Op::Metadata => {
-                buf.push(OP_META);
-            }
-        }
-        // Trailing meta section: [pairs_count:2][key:1][value_len:2][value × N] ...
-        buf.extend_from_slice(&(self.meta.len() as u16).to_be_bytes());
-        for (key, value) in &self.meta {
-            buf.push(*key);
-            buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
-            buf.extend_from_slice(value);
         }
         buf
     }
 
     pub fn decode(bytes: &[u8]) -> Result<ManifestOp, DecodeError> {
-        let mut d = Decoder::new(bytes);
-        let op = match d.u8()? {
+        let frame = FrameParser::new(bytes)?;
+        let op_type = frame.get_u8(TAG_OP_TYPE)?;
+        let op = match op_type {
             OP_CREATE_SEGMENT => Op::CreateSegment {
-                id:          SegmentId(d.u32()?),
-                first_entry: EntryId(d.u64()?),
+                id:          SegmentId(frame.get_u32(TAG_SEGMENT_ID)?),
+                first_entry: EntryId(frame.get_u64(TAG_FIRST_ENTRY)?),
             },
             OP_ROLL_SEGMENT => Op::RollSegment {
-                sealed_id:       SegmentId(d.u32()?),
-                first_entry:     EntryId(d.u64()?),
-                last_entry:      EntryId(d.u64()?),
-                entry_count:     d.u32()?,
-                final_size:      d.u64()?,
-                new_id:          SegmentId(d.u32()?),
-                new_first_entry: EntryId(d.u64()?),
+                sealed_id:       SegmentId(frame.get_u32(TAG_SEGMENT_ID)?),
+                first_entry:     EntryId(frame.get_u64(TAG_FIRST_ENTRY)?),
+                last_entry:      EntryId(frame.get_u64(TAG_LAST_ENTRY)?),
+                entry_count:     frame.get_u32(TAG_ENTRY_COUNT)?,
+                final_size:      frame.get_u64(TAG_FINAL_SIZE)?,
+                new_id:          SegmentId(frame.get_u32(TAG_NEW_SEGMENT_ID)?),
+                new_first_entry: EntryId(frame.get_u64(TAG_NEW_FIRST_ENTRY)?),
             },
             OP_TRUNCATE_START => {
-                let first_entry = EntryId(d.u64()?);
-                let drop_count  = d.u32()? as usize;
-                let mut drop = Vec::with_capacity(drop_count.min(64));
-                for _ in 0..drop_count { drop.push(SegmentId(d.u32()?)); }
+                let first_entry = EntryId(frame.get_u64(TAG_FIRST_ENTRY)?);
+                let drop = frame.get_u32s(TAG_DROP_ID)
+                    .map(|r| r.map(SegmentId))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Op::TruncateStart { first_entry, drop }
             }
             OP_TRUNCATE_END => {
-                let new_active_id = SegmentId(d.u32()?);
-                let byte_offset   = d.u64()?;
-                let drop_count    = d.u32()? as usize;
-                let mut drop = Vec::with_capacity(drop_count.min(64));
-                for _ in 0..drop_count { drop.push(SegmentId(d.u32()?)); }
+                let new_active_id = SegmentId(frame.get_u32(TAG_NEW_SEGMENT_ID)?);
+                let byte_offset   = frame.get_u64(TAG_BYTE_OFFSET)?;
+                let drop = frame.get_u32s(TAG_DROP_ID)
+                    .map(|r| r.map(SegmentId))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Op::TruncateEnd { new_active_id, byte_offset, drop }
             }
-            OP_SEGMENT_DELETED => Op::SegmentDeleted { id: SegmentId(d.u32()?) },
-            OP_RECORD_ORPHAN   => Op::RecordOrphan   { id: SegmentId(d.u32()?) },
+            OP_SEGMENT_DELETED => Op::SegmentDeleted { id: SegmentId(frame.get_u32(TAG_SEGMENT_ID)?) },
+            OP_RECORD_ORPHAN   => Op::RecordOrphan   { id: SegmentId(frame.get_u32(TAG_SEGMENT_ID)?) },
             OP_META            => Op::Metadata,
             tag                => return Err(DecodeError::UnknownOpType(tag)),
         };
-        // Trailing meta section — absent in pre-meta manifests, treated as empty.
-        let meta = if d.remaining() >= 2 {
-            let pairs_count = d.u16()? as usize;
-            let mut meta = Vec::with_capacity(pairs_count.min(32));
-            for _ in 0..pairs_count {
-                let key       = d.u8()?;
-                let value_len = d.u16()? as usize;
-                let value     = d.bytes(value_len)?.to_vec();
-                meta.push((key, value));
-            }
-            meta
-        } else {
-            vec![]
-        };
+        let meta = frame.get_frames(TAG_META)
+            .map(|r| {
+                let f     = r?;
+                let key   = f.get_u8(TAG_META_KEY)?;
+                let value = f.get_data(TAG_META_VALUE)?.to_vec();
+                Ok((key, value))
+            })
+            .collect::<Result<Vec<_>, DecodeError>>()?;
         Ok(ManifestOp { op, meta })
-    }
-}
-
-struct Decoder<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Decoder<'a> {
-    fn new(buf: &'a [u8]) -> Self { Self { buf, pos: 0 } }
-
-    fn remaining(&self) -> usize { self.buf.len().saturating_sub(self.pos) }
-
-    fn u8(&mut self) -> Result<u8, DecodeError> {
-        let b = self.buf.get(self.pos).copied().ok_or(DecodeError::Truncated)?;
-        self.pos += 1;
-        Ok(b)
-    }
-
-    fn u16(&mut self) -> Result<u16, DecodeError> {
-        let end = self.pos.checked_add(2).ok_or(DecodeError::Truncated)?;
-        let chunk: &[u8; 2] = self.buf.get(self.pos..end)
-            .ok_or(DecodeError::Truncated)?
-            .try_into().unwrap();
-        self.pos = end;
-        Ok(u16::from_be_bytes(*chunk))
-    }
-
-    fn u32(&mut self) -> Result<u32, DecodeError> {
-        let end = self.pos.checked_add(4).ok_or(DecodeError::Truncated)?;
-        let chunk: &[u8; 4] = self.buf.get(self.pos..end)
-            .ok_or(DecodeError::Truncated)?
-            .try_into().unwrap();
-        self.pos = end;
-        Ok(u32::from_be_bytes(*chunk))
-    }
-
-    fn u64(&mut self) -> Result<u64, DecodeError> {
-        let end = self.pos.checked_add(8).ok_or(DecodeError::Truncated)?;
-        let chunk: &[u8; 8] = self.buf.get(self.pos..end)
-            .ok_or(DecodeError::Truncated)?
-            .try_into().unwrap();
-        self.pos = end;
-        Ok(u64::from_be_bytes(*chunk))
-    }
-
-    fn bytes(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
-        let end = self.pos.checked_add(len).ok_or(DecodeError::Truncated)?;
-        let slice = self.buf.get(self.pos..end).ok_or(DecodeError::Truncated)?;
-        self.pos = end;
-        Ok(slice)
     }
 }
 
@@ -678,17 +637,19 @@ mod tests {
 
     #[test]
     fn codec_unknown_op_type() {
-        assert!(matches!(ManifestOp::decode(&[0xff]), Err(DecodeError::UnknownOpType(0xff))));
+        let mut buf = Vec::new();
+        { let mut f = FrameBuilder::new(&mut buf); f.add_u8(TAG_OP_TYPE, 0xff); }
+        assert!(matches!(ManifestOp::decode(&buf), Err(DecodeError::UnknownOpType(0xff))));
     }
 
     #[test]
     fn codec_empty_payload() {
-        assert!(matches!(ManifestOp::decode(&[]), Err(DecodeError::Truncated)));
+        assert!(matches!(ManifestOp::decode(&[]), Err(DecodeError::Format(_))));
     }
 
     #[test]
     fn codec_truncated_create_segment() {
         let encoded = ManifestOp::bare(Op::CreateSegment { id: seg(1), first_entry: entry(0) }).encode();
-        assert!(matches!(ManifestOp::decode(&encoded[..5]), Err(DecodeError::Truncated)));
+        assert!(matches!(ManifestOp::decode(&encoded[..5]), Err(DecodeError::Format(_))));
     }
 }
